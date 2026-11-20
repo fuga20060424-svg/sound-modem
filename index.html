@@ -1,0 +1,208 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>音響通信受信機</title>
+<style>
+body {
+  font-family: sans-serif;
+  max-width: 600px;
+  margin: 40px auto;
+  padding: 20px;
+  background: #f3f4f6;
+  color: #222;
+}
+main {
+  background: white;
+  padding: 24px;
+  border-radius: 16px;
+}
+button {
+  padding: 14px;
+  width: 100%;
+  margin: 8px 0;
+  border: 0;
+  border-radius: 10px;
+  background: #2563eb;
+  color: white;
+  font-size: 16px;
+}
+button:disabled { opacity: .4; }
+#result {
+  font-size: 24px;
+  overflow-wrap: anywhere;
+  min-height: 40px;
+}
+#status { color: #555; }
+</style>
+</head>
+<body>
+<main>
+<h1>音響通信受信機</h1>
+<p>PCから送られるFSK信号を受信します。</p>
+<button id="start">① マイクを起動</button>
+<button id="stop" disabled>② 録音を終了して解析</button>
+<p id="status">待機中</p>
+<h2>受信した文字</h2>
+<div id="result">---</div>
+</main>
+
+<script>
+const RATE = 44100;
+const BIT_DURATION = 0.08;
+const FREQ0 = 1200;
+const FREQ1 = 2200;
+const START_FREQ = 800;
+
+let context, processor, source, stream;
+let samples = [];
+let recording = false;
+
+const status = document.getElementById("status");
+const result = document.getElementById("result");
+const startButton = document.getElementById("start");
+const stopButton = document.getElementById("stop");
+
+function powerAt(data, freq, rate) {
+  let re = 0, im = 0;
+  const omega = 2 * Math.PI * freq / rate;
+  for (let i = 0; i < data.length; i++) {
+    const w = 0.5 - 0.5 * Math.cos(
+      2 * Math.PI * i / (data.length - 1)
+    );
+    const v = data[i] * w;
+    re += v * Math.cos(omega * i);
+    im -= v * Math.sin(omega * i);
+  }
+  return re * re + im * im;
+}
+
+function readTone(data, freqA, freqB, rate) {
+  return powerAt(data, freqA, rate) >
+         powerAt(data, freqB, rate) ? 0 : 1;
+}
+
+function decode() {
+  const rate = context.sampleRate;
+  const markerSize = Math.floor(rate * 0.05);
+  const hop = Math.floor(rate * 0.01);
+
+  let marker = -1;
+
+  // 800Hzの開始音を探す
+  for (let i = 0; i + markerSize < samples.length; i += hop) {
+    const part = samples.slice(i, i + markerSize);
+    const p800 = powerAt(part, START_FREQ, rate);
+    const p1200 = powerAt(part, FREQ0, rate);
+    const p2200 = powerAt(part, FREQ1, rate);
+
+    if (p800 > p1200 * 2 && p800 > p2200 * 2) {
+      marker = i;
+      break;
+    }
+  }
+
+  if (marker < 0) {
+    throw new Error("開始信号が見つかりません。");
+  }
+
+  // 開始音は0.3秒。音の中央からデータを読む
+  const dataStart = marker + Math.floor(rate * 0.325);
+  const bitSize = Math.floor(rate * BIT_DURATION);
+  const bits = [];
+
+  for (let i = 0; dataStart + (i + 1) * bitSize <= samples.length; i++) {
+    const offset = dataStart + i * bitSize;
+    const part = samples.slice(
+      offset + Math.floor(bitSize * 0.2),
+      offset + Math.floor(bitSize * 0.8)
+    );
+
+    if (part.length < 100) break;
+
+    // 終了音800Hzを検出
+    const p800 = powerAt(part, START_FREQ, rate);
+    const p1200 = powerAt(part, FREQ0, rate);
+    const p2200 = powerAt(part, FREQ1, rate);
+
+    if (p800 > p1200 * 2 && p800 > p2200 * 2) break;
+
+    bits.push(readTone(part, FREQ0, FREQ1, rate));
+  }
+
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    let byte = 0;
+    for (let j = 0; j < 8; j++) {
+      byte = (byte << 1) | bits[i + j];
+    }
+    bytes.push(byte);
+  }
+
+  if (!bytes.length) {
+    throw new Error("データが読み取れませんでした。");
+  }
+
+  return new TextDecoder("utf-8", {fatal: true}).decode(
+    new Uint8Array(bytes)
+  );
+}
+
+startButton.onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+
+    context = new AudioContext();
+    await context.resume();
+
+    source = context.createMediaStreamSource(stream);
+    processor = context.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = event => {
+      if (recording) {
+        samples.push(...event.inputBuffer.getChannelData(0));
+      }
+    };
+
+    source.connect(processor);
+    processor.connect(context.destination);
+
+    samples = [];
+    recording = true;
+    startButton.disabled = true;
+    stopButton.disabled = false;
+    status.textContent = "受信中！PCから音を送ってください。";
+  } catch (e) {
+    status.textContent = "マイクエラー：" + e.message;
+  }
+};
+
+stopButton.onclick = () => {
+  recording = false;
+  stream.getTracks().forEach(track => track.stop());
+  processor.disconnect();
+  source.disconnect();
+
+  try {
+    const message = decode();
+    result.textContent = message;
+    status.textContent = "受信成功！";
+  } catch (e) {
+    result.textContent = "---";
+    status.textContent = "解析失敗：" + e.message;
+  }
+
+  startButton.disabled = false;
+  stopButton.disabled = true;
+};
+</script>
+</body>
+</html>
