@@ -4,205 +4,99 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>音響通信受信機</title>
+<title>音声受信テスト</title>
 <style>
 body {
   font-family: sans-serif;
-  max-width: 600px;
-  margin: 40px auto;
-  padding: 20px;
-  background: #f3f4f6;
-  color: #222;
-}
-main {
-  background: white;
-  padding: 24px;
-  border-radius: 16px;
+  text-align: center;
+  padding: 30px 15px;
+  background: #f3f5f7;
 }
 button {
-  padding: 14px;
+  font-size: 20px;
+  padding: 14px 24px;
+  margin: 15px;
+}
+#meter {
   width: 100%;
-  margin: 8px 0;
-  border: 0;
-  border-radius: 10px;
-  background: #2563eb;
-  color: white;
-  font-size: 16px;
+  height: 28px;
+  background: #ddd;
+  border-radius: 20px;
+  overflow: hidden;
+  margin-top: 25px;
 }
-button:disabled { opacity: .4; }
-#result {
+#bar {
+  width: 0%;
+  height: 100%;
+  background: #20a060;
+  transition: width 0.05s;
+}
+#level {
   font-size: 24px;
-  overflow-wrap: anywhere;
-  min-height: 40px;
+  margin-top: 15px;
 }
-#status { color: #555; }
 </style>
 </head>
 <body>
-<main>
-<h1>音響通信受信機</h1>
-<p>PCから送られるFSK信号を受信します。</p>
-<button id="start">① マイクを起動</button>
-<button id="stop" disabled>② 録音を終了して解析</button>
-<p id="status">待機中</p>
-<h2>受信した文字</h2>
-<div id="result">---</div>
-</main>
+<h2>音声受信テスト</h2>
+<p id="status">マイクは停止中です</p>
+<button id="start">マイク開始</button>
+<div id="meter"><div id="bar"></div></div>
+<p id="level">音量：0</p>
 
 <script>
-const RATE = 44100;
-const BIT_DURATION = 0.08;
-const FREQ0 = 1200;
-const FREQ1 = 2200;
-const START_FREQ = 800;
+let stream;
+let context;
+let analyser;
+let data;
+let running = false;
 
-let context, processor, source, stream;
-let samples = [];
-let recording = false;
-
-const status = document.getElementById("status");
-const result = document.getElementById("result");
-const startButton = document.getElementById("start");
-const stopButton = document.getElementById("stop");
-
-function powerAt(data, freq, rate) {
-  let re = 0, im = 0;
-  const omega = 2 * Math.PI * freq / rate;
-  for (let i = 0; i < data.length; i++) {
-    const w = 0.5 - 0.5 * Math.cos(
-      2 * Math.PI * i / (data.length - 1)
-    );
-    const v = data[i] * w;
-    re += v * Math.cos(omega * i);
-    im -= v * Math.sin(omega * i);
-  }
-  return re * re + im * im;
-}
-
-function readTone(data, freqA, freqB, rate) {
-  return powerAt(data, freqA, rate) >
-         powerAt(data, freqB, rate) ? 0 : 1;
-}
-
-function decode() {
-  const rate = context.sampleRate;
-  const markerSize = Math.floor(rate * 0.05);
-  const hop = Math.floor(rate * 0.01);
-
-  let marker = -1;
-
-  // 800Hzの開始音を探す
-  for (let i = 0; i + markerSize < samples.length; i += hop) {
-    const part = samples.slice(i, i + markerSize);
-    const p800 = powerAt(part, START_FREQ, rate);
-    const p1200 = powerAt(part, FREQ0, rate);
-    const p2200 = powerAt(part, FREQ1, rate);
-
-    if (p800 > p1200 * 2 && p800 > p2200 * 2) {
-      marker = i;
-      break;
-    }
-  }
-
-  if (marker < 0) {
-    throw new Error("開始信号が見つかりません。");
-  }
-
-  // 開始音は0.3秒。音の中央からデータを読む
-  const dataStart = marker + Math.floor(rate * 0.325);
-  const bitSize = Math.floor(rate * BIT_DURATION);
-  const bits = [];
-
-  for (let i = 0; dataStart + (i + 1) * bitSize <= samples.length; i++) {
-    const offset = dataStart + i * bitSize;
-    const part = samples.slice(
-      offset + Math.floor(bitSize * 0.2),
-      offset + Math.floor(bitSize * 0.8)
-    );
-
-    if (part.length < 100) break;
-
-    // 終了音800Hzを検出
-    const p800 = powerAt(part, START_FREQ, rate);
-    const p1200 = powerAt(part, FREQ0, rate);
-    const p2200 = powerAt(part, FREQ1, rate);
-
-    if (p800 > p1200 * 2 && p800 > p2200 * 2) break;
-
-    bits.push(readTone(part, FREQ0, FREQ1, rate));
-  }
-
-  const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) {
-    let byte = 0;
-    for (let j = 0; j < 8; j++) {
-      byte = (byte << 1) | bits[i + j];
-    }
-    bytes.push(byte);
-  }
-
-  if (!bytes.length) {
-    throw new Error("データが読み取れませんでした。");
-  }
-
-  return new TextDecoder("utf-8", {fatal: true}).decode(
-    new Uint8Array(bytes)
-  );
-}
-
-startButton.onclick = async () => {
+document.getElementById("start").onclick = async () => {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
+      audio: true
     });
 
     context = new AudioContext();
-    await context.resume();
+    const source = context.createMediaStreamSource(stream);
+    analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
 
-    source = context.createMediaStreamSource(stream);
-    processor = context.createScriptProcessor(4096, 1, 1);
+    data = new Float32Array(analyser.fftSize);
+    running = true;
 
-    processor.onaudioprocess = event => {
-      if (recording) {
-        samples.push(...event.inputBuffer.getChannelData(0));
-      }
-    };
+    document.getElementById("status").textContent =
+      "マイク受信中";
+    document.getElementById("start").disabled = true;
 
-    source.connect(processor);
-    processor.connect(context.destination);
-
-    samples = [];
-    recording = true;
-    startButton.disabled = true;
-    stopButton.disabled = false;
-    status.textContent = "受信中！PCから音を送ってください。";
-  } catch (e) {
-    status.textContent = "マイクエラー：" + e.message;
+    updateMeter();
+  } catch (error) {
+    document.getElementById("status").textContent =
+      "エラー：" + error.message;
   }
 };
 
-stopButton.onclick = () => {
-  recording = false;
-  stream.getTracks().forEach(track => track.stop());
-  processor.disconnect();
-  source.disconnect();
+function updateMeter() {
+  if (!running) return;
 
-  try {
-    const message = decode();
-    result.textContent = message;
-    status.textContent = "受信成功！";
-  } catch (e) {
-    result.textContent = "---";
-    status.textContent = "解析失敗：" + e.message;
+  analyser.getFloatTimeDomainData(data);
+
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    sum += data[i] * data[i];
   }
 
-  startButton.disabled = false;
-  stopButton.disabled = true;
-};
+  const volume = Math.sqrt(sum / data.length);
+  const percent = Math.min(100, volume * 500);
+
+  document.getElementById("bar").style.width =
+    percent + "%";
+  document.getElementById("level").textContent =
+    "音量：" + volume.toFixed(4);
+
+  requestAnimationFrame(updateMeter);
+}
 </script>
 </body>
 </html>
